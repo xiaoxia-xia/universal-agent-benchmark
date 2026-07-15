@@ -1,17 +1,11 @@
 import argparse
-import operator
 import os
 import sys
 from pathlib import Path
-from typing import Annotated
 
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI
-from langgraph.graph import StateGraph, START, END
-from langgraph.prebuilt import ToolNode, tools_condition
-from typing_extensions import TypedDict
+from crewai import Agent, Task, Crew, Process, LLM
+from crewai.tools import tool
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -24,22 +18,18 @@ from verticals.ecommerce_trend_research import tools as ecommerce_tools
 from verticals.medical_diagnostic import tools as medical_tools
 
 TASK_PATH = ROOT / "verticals" / "smoke_test" / "task_001.json"
-FRAMEWORK_NAME = "langgraph"
+FRAMEWORK_NAME = "crewai"
 
 load_dotenv(ROOT / ".env", override=False)
 
 
-class MessagesState(TypedDict):
-    messages: Annotated[list, operator.add]
-
-
-@tool
+@tool("search_literature")
 def search_literature(pubmed_id: str) -> str:
     """Look up the research abstract for a given PubMed ID."""
     return medical_tools.search_literature(pubmed_id)
 
 
-@tool
+@tool("get_review_history")
 def get_review_history(parent_asin: str) -> str:
     """Look up the yearly review-count and average-rating history for a product."""
     return ecommerce_tools.get_review_history(parent_asin)
@@ -62,55 +52,58 @@ def _select_tools(vertical: str, allowed_tools: list[str] | None) -> list:
 def _run_agent(
     prompt: str, vertical: str, allowed_tools: list[str] | None = None
 ) -> str:
-    model_name = os.getenv("OPENAI_MODEL", "gpt-4")
     api_key = os.getenv("OPENAI_API_KEY")
     base_url = os.getenv("OPENAI_BASE_URL")
+    model_name = os.getenv("OPENAI_MODEL", "gpt-4")
 
-    llm = ChatOpenAI(
-        model=model_name,
+    # CrewAI often expects OpenAI models in this form:
+    # openai/gpt-4, openai/gpt-4o-mini, etc.
+    crewai_model_name = model_name if "/" in model_name else f"openai/{model_name}"
+
+    llm = LLM(
+        model=crewai_model_name,
         api_key=api_key,
         base_url=base_url,
         temperature=0,
     )
 
     tools = _select_tools(vertical, allowed_tools)
-    use_tools = bool(tools)
-    llm_bound = llm.bind_tools(tools) if use_tools else llm
 
-    def call_model(state: MessagesState):
-        response = llm_bound.invoke(
-            [
-                SystemMessage(
-                    content=(
-                        "You are a benchmark smoke-test agent. "
-                        "Follow the user's output format exactly. "
-                        "Do not add markdown."
-                    )
-                )
-            ]
-            + state["messages"]
-        )
-        return {"messages": [response]}
+    agent = Agent(
+        role="Benchmark Smoke Test Agent",
+        goal="Return a clean structured JSON response for a framework benchmark.",
+        backstory=(
+            "You are used only for testing whether CrewAI can run the same "
+            "standardized benchmark task as LangGraph and OpenAI Agents SDK."
+        ),
+        llm=llm,
+        tools=tools,
+        verbose=False,
+        allow_delegation=False,
+    )
 
-    graph_builder = StateGraph(MessagesState)
-    graph_builder.add_node("call_model", call_model)
-    graph_builder.add_edge(START, "call_model")
+    task = Task(
+        description=prompt,
+        expected_output=(
+            "Exactly one JSON object matching the schema specified in the task "
+            "description above. No markdown. No extra text."
+        ),
+        agent=agent,
+    )
 
-    if use_tools:
-        graph_builder.add_node("tools", ToolNode(tools))
-        graph_builder.add_conditional_edges("call_model", tools_condition)
-        graph_builder.add_edge("tools", "call_model")
-    else:
-        graph_builder.add_edge("call_model", END)
+    crew = Crew(
+        agents=[agent],
+        tasks=[task],
+        process=Process.sequential,
+        verbose=False,
+    )
 
-    agent_graph = graph_builder.compile()
-
-    result = agent_graph.invoke({"messages": [HumanMessage(content=prompt)]})
-    return result["messages"][-1].content
+    result = crew.kickoff()
+    return str(result)
 
 
 def run_task(task: BenchmarkTask) -> AgentRunResult:
-    context = begin_run(FRAMEWORK_NAME, "langgraph")
+    context = begin_run(FRAMEWORK_NAME, "crewai")
     medical_tools.reset_call_log()
     ecommerce_tools.reset_call_log()
     try:
